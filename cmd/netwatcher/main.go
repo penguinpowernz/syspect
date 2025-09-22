@@ -1,18 +1,26 @@
 package main
 
-// AI SLOP
-
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"syscall"
-	"time"
 
-	"github.com/shirou/gopsutil/net"
 	"github.com/shirou/gopsutil/process"
 )
+
+var (
+	localIPs    []string
+	listenPorts []string
+	cache       = map[string]*Event{}
+)
+
+func init() {
+	localIPs, _ = getLocalIps()
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -20,119 +28,193 @@ func main() {
 		return
 	}
 
-	_pid := os.Args[1]
-
-	// Set up a channel to listen for interrupt signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		fmt.Println("\nExiting...")
-		os.Exit(0)
-	}()
-
-	pid, err := strconv.Atoi(_pid)
-	if err != nil {
-		fmt.Printf("Error parsing PID: %v\n", err)
+	if !checkWeCanRunBpftrace() {
 		return
 	}
 
-	pp, err := process.NewProcess(int32(pid))
-	if err != nil {
-		fmt.Printf("Error retrieving process: %v\n", err)
-		return
-	}
+	pid := parsePid(os.Args[1])
 
-	cache := NewCache()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	t1 := time.NewTicker(time.Second / 10).C
-	t2 := time.NewTicker(time.Second / 2).C
-
-	exe, err := pp.Exe()
+	pm, err := NewProcessMonitor(pid)
 	if err != nil {
 		panic(err)
 	}
 
-	for {
-		select {
-		case <-sigChan:
-			fmt.Println("\nExiting...")
-			return
+	pipe := new(renderPipeline)
+	pipe.add(validate)
+	pipe.add(parse)
+	pipe.add(ignore)
+	pipe.add(trackListening)
+	pipe.add(resolveDirection)
+	pipe.add(caching)
+	pipe.add(render)
 
-		case <-t1:
-			checkConnections(pp, cache)
+	// fmt.Println("found local IPs", localIPs)
+	go updateLocalIPs()
+	scnr := NewScanner(pid)
+	scnr.OnEvent(func(ev string) { pipe.run(ev) })
+	scanListeningPorts(pid)
 
-		case <-t2:
-			yes, err := pp.IsRunning()
-			if err != nil {
-				panic(err)
-			}
-			if !yes {
-				fmt.Println("Process stopped. Waiting for new process...")
-				pp = waitForNewProcess(exe)
-				fmt.Println("Found new process with PID:", pp.Pid)
-				cache = NewCache()
-			}
-		}
+	go scnr.Start(ctx)
+	pm.OnChange(func(pid int) {
+		scanListeningPorts(pid)
+		go scnr.Reset(pid)
+	})
+	pm.Start(ctx)
+}
+
+type renderPipeline struct {
+	handlers []func(*RenderContext)
+}
+
+func (r *renderPipeline) add(handler func(*RenderContext)) {
+	r.handlers = append(r.handlers, handler)
+}
+
+func (r *renderPipeline) run(evs string) {
+	ctx := &RenderContext{evs: evs, ok: true}
+	for _, handler := range r.handlers {
+		handler(ctx)
 	}
 }
 
-func checkConnections(pp *process.Process, cache *Cache) {
+type RenderContext struct {
+	evs string
+	ev  *Event
+	ok  bool
+}
+
+func render(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	switch {
+	case ctx.ev.Status == "LISTEN":
+		fmt.Printf("🟢 LISTEN %s %s\n", ctx.ev.protoFam, ctx.ev.Local.String())
+		return
+
+	case ctx.ev.incoming:
+		fmt.Printf("👈 %s %20s <- %-20s\n", ctx.ev.protoFam, ctx.ev.Local.String(), ctx.ev.Remote.String())
+		return
+
+	default:
+		fmt.Printf("👉 %s %20s -> %-20s\n", ctx.ev.protoFam, ctx.ev.Local.String(), ctx.ev.Remote.String())
+		return
+	}
+}
+
+func parse(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	ctx.ev = NewEvent(ctx.evs)
+}
+
+func trackListening(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	if ctx.ev.Status == "LISTEN" {
+		listenPorts = append(listenPorts, ctx.ev.Local.String())
+	}
+}
+
+func caching(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	x := []string{
+		ctx.ev.Local.String(),
+		ctx.ev.Remote.String(),
+	}
+	sort.Strings(x)
+
+	key := fmt.Sprintf("%s-%s", x[0], x[1])
+	if _, found := cache[key]; found {
+		ctx.ok = false
+		return
+	}
+
+	cache[key] = ctx.ev
+}
+
+func ignore(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	if ctx.ev.Status == "NONE" {
+		ctx.ok = false
+	}
+}
+
+func validate(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	if ctx.evs[0] != ':' {
+		ctx.ok = false
+	}
+}
+
+// we have two situations we want to track
+// - clients connecting to the listening ports
+// - the binary connecting to any non client port
+func resolveDirection(ctx *RenderContext) {
+	if !ctx.ok {
+		return
+	}
+
+	if ctx.ev.Status == "LISTEN" {
+		return
+	}
+
+	src := ctx.ev.Source
+	dst := ctx.ev.Dest
+
+	if dst.IsListeningPort() {
+		ctx.ev.Local = &ctx.ev.Dest
+		ctx.ev.Remote = &ctx.ev.Source
+		ctx.ev.incoming = true
+		return
+	}
+
+	if !src.IsListeningPort() && src.IsLocalIP() {
+		ctx.ev.Local = &ctx.ev.Source
+		ctx.ev.Remote = &ctx.ev.Dest
+		ctx.ev.incoming = false
+		return
+	}
+
+	ctx.ok = false
+}
+
+func scanListeningPorts(pid int) {
+	pp, err := process.NewProcess(int32(pid))
+	if err != nil {
+		panic(err)
+	}
+
 	conns, err := pp.Connections()
 	if err != nil {
-		fmt.Printf("Error retrieving connections: %v\n", err)
-		return
+		panic(err)
 	}
 
+	listenPorts = listenPorts[:0]
 	for _, conn := range conns {
-		if conn.Status != "ESTABLISHED" {
-			continue
-		}
-		cache.Add(conn)
-	}
-}
-
-func waitForNewProcess(name string) *process.Process {
-	for {
-		ps, err := process.Processes()
-		if err != nil {
-			panic(err)
-		}
-
-		for _, p := range ps {
-			exe, err := p.Exe()
-			if err != nil {
-				continue
+		if conn.Status == "LISTEN" {
+			listenPorts = append(listenPorts, conn.Laddr.IP+":"+strconv.Itoa(int(conn.Laddr.Port)))
+			if conn.Laddr.IP == "::" {
+				listenPorts = append(listenPorts, "127.0.0.1:"+strconv.Itoa(int(conn.Laddr.Port)))
 			}
-			if exe == name {
-				return p
-			}
+			fmt.Printf("🟢 LISTEN %s\n", conn.Laddr.IP+":"+strconv.Itoa(int(conn.Laddr.Port)))
 		}
-
-		time.Sleep(time.Second)
 	}
-}
-
-type Cache struct {
-	entries map[string]net.ConnectionStat
-}
-
-func NewCache() *Cache {
-	return &Cache{
-		entries: make(map[string]net.ConnectionStat),
-	}
-}
-
-func (c *Cache) Add(conn net.ConnectionStat) {
-	key := conn.Raddr.String()
-	if _, found := c.entries[key]; found {
-		return
-	}
-	c.entries[key] = conn
-
-	fmt.Printf("Local: %s:%d, Remote: %s:%d, Status: %s\n",
-		conn.Laddr.IP, conn.Laddr.Port,
-		conn.Raddr.IP, conn.Raddr.Port,
-		conn.Status)
 }

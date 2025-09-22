@@ -67,3 +67,20 @@ A process network connection tracker that:
 - Tracks new connections in real-time
 - Handles process restarts automatically by searching for the process name
 
+```
+$ netwatcher 1101
+🟢 LISTEN :::9273
+👀 watching process /usr/bin/telegraf
+👍 started BPF trace
+👈 tcp4       127.0.0.1:9273 <- 127.0.0.1:53010     
+👈 tcp4       127.0.0.1:9273 <- 127.0.0.1:53026     
+👈 tcp4       127.0.0.1:9273 <- 127.0.0.1:53034     
+👉 tcp4  192.168.1.102:38276 -> 35.223.238.178:443  
+👉 tcp4  192.168.1.102:50880 -> 54.192.221.113:80   
+👉 tcp4  192.168.1.102:42546 -> 172.105.169.139:443 
+☠️ process we were monitoring died
+🔍 watching for new '/usr/bin/telegraf' process to start
+👀 new process started on 3450624
+🟢 LISTEN :::9273
+👍 started BPF trace
+```
