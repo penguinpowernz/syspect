@@ -129,6 +129,8 @@ An ANSI code stripping utility that:
 - Removes ANSI terminal color/formatting codes from files
 - Can be used to sanitize log files or terminal output
 
+**YOU SHOULD BE SCARED OF ANSI CODES** https://www.youtube.com/watch?v=3T2Al3jdY38
+
 **Usage**:
 ```
 antibus <file1> [file2] ...
