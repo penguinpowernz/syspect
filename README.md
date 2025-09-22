@@ -22,7 +22,7 @@ Passing an absolute path will perform a full analysis, while a filename will sea
 
 ### antibus
 
-> ![WARNING]
+> [!WARNING]
 > Work in progress
 
 An ANSI code stripping utility that:
@@ -36,7 +36,7 @@ antibus <file1> [file2] ...
 
 ### cmdscan
 
-> ![NOTE]
+> [!NOTE]
 > Requires auditd to be installed and running and monitoring commands being executed
 
 A Linux audit log command execution monitor that:
